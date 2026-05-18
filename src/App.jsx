@@ -157,9 +157,9 @@ export default function App() {
         setWrongOnLevel(0);
       }
       // FIX: if player has entered this round, mark entered
-      if(Number(stats.secondsInGame) > 0 || lvl > 0 || Number(stats.totalAttempts) > 0){
+      if(Number(stats.secondsInGame) > 0 || lvl > 0 || Number(stats.totalAttempts) > 0 || Number(stats.score) > 0){
         setEntered(true);
-      }
+    }
     } catch(e){ console.error(e); }
   };
 
@@ -176,9 +176,9 @@ export default function App() {
       setHintTokens(Number(stats.hintTokensLeft));
       setWon(stats.hasWon);
       if(stats.isLockedOut) setLockout(Number(stats.lockoutSecondsRemaining));
-      if(Number(stats.secondsInGame) > 0 || lvl > 0 || Number(stats.totalAttempts) > 0){
+      if(Number(stats.secondsInGame) > 0 || lvl > 0 || Number(stats.totalAttempts) > 0 || Number(stats.score) > 0){
         setEntered(true);
-      }
+    }
       // get wrongOnCurrentLevel
       try {
         const raw = await c.players(addr);
