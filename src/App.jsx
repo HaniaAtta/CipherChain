@@ -264,18 +264,18 @@ export default function App() {
       setAnswer("");
       setWrongOnLevel(0);
       setPartialHint("");
+      setFeedback({type:"ok",msg:"✅ Correct! Moving to next level..."});
       await loadMyStats();
       await loadGameStatus();
-      setFeedback({type:"ok",msg:"✅ Correct! Moving to next level..."});
     } catch(e){
       const msg = e.reason || e.message || "";
       if(msg.includes("wrong answer")){
         // FIX: reload from chain to get accurate wrongOnCurrentLevel
-        await loadMyStats();
         setFeedback({type:"err",msg:`❌ Wrong answer. Try again!`});
-      } else if(msg.includes("locked out")){
         await loadMyStats();
+      } else if(msg.includes("locked out")){
         setFeedback({type:"err",msg:"🔒 Too many wrong answers. Locked out for 1 hour."});
+        await loadMyStats();
       } else if(msg.includes("enter the game")){
         setFeedback({type:"err",msg:"❌ Please enter the game first."});
       } else {
