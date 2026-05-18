@@ -677,7 +677,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ── WINNERS ───────────────────────────────────────────────────── */}
+        {/* ── WINNERS ─────────────────────────────────────────────── */}
         {page==="winners" && (
           <div>
             <div style={{color:"#555",fontSize:11,letterSpacing:4,marginBottom:16,borderBottom:"1px solid #111",paddingBottom:8}}>🏆 WINNER HISTORY</div>
