@@ -2,7 +2,10 @@ import { useState, useEffect, useRef } from "react";
 import { ethers } from "ethers";
 import { CONTRACT_ADDRESS, ABI } from "./contract";
 
-const HINTS = [
+// Hints are now fetched live from the contract via getHint() so the card
+// always shows the puzzle that matches the player's on-chain currentLevel.
+// This fallback array is only used if the RPC call fails.
+const HINT_FALLBACK = [
   "I am a chain of blocks where each block holds transaction data. Tamper with one block and the entire chain breaks. What am I?",
   "I am a pseudonymous person or group who published the Bitcoin whitepaper in 2008 and vanished. Who am I?",
   "I am block number zero. Every blockchain begins with me. I have no parent. What am I called?",
@@ -16,25 +19,28 @@ const HINTS = [
 ];
 
 const LEVELS = [
-  { id:1, difficulty:"Easy",      topic:"What is a blockchain?"         },
-  { id:2, difficulty:"Easy",      topic:"Who created Bitcoin?"           },
-  { id:3, difficulty:"Easy",      topic:"What is block zero?"            },
-  { id:4, difficulty:"Medium",    topic:"ETH consensus mechanism"        },
-  { id:5, difficulty:"Medium",    topic:"Bitcoin consensus mechanism"    },
-  { id:6, difficulty:"Medium",    topic:"Ethereum execution cost unit"   },
-  { id:7, difficulty:"Hard",      topic:"Read Solidity — find the bug"   },
-  { id:8, difficulty:"Hard",      topic:"Trustless property"             },
-  { id:9, difficulty:"Very Hard", topic:"Decode binary to ASCII"         },
-  { id:10,difficulty:"Extreme",   topic:"4th Bitcoin halving reward"     },
+  { id:1,  difficulty:"Easy",      topic:"What is a blockchain?"         },
+  { id:2,  difficulty:"Easy",      topic:"Who created Bitcoin?"           },
+  { id:3,  difficulty:"Easy",      topic:"What is block zero?"            },
+  { id:4,  difficulty:"Medium",    topic:"ETH consensus mechanism"        },
+  { id:5,  difficulty:"Medium",    topic:"Bitcoin consensus mechanism"    },
+  { id:6,  difficulty:"Medium",    topic:"Ethereum execution cost unit"   },
+  { id:7,  difficulty:"Hard",      topic:"Read Solidity — find the bug"   },
+  { id:8,  difficulty:"Hard",      topic:"Trustless property"             },
+  { id:9,  difficulty:"Very Hard", topic:"Decode binary to ASCII"         },
+  { id:10, difficulty:"Extreme",   topic:"4th Bitcoin halving reward"     },
 ];
 
 const DIFF_COLOR = {
-  Easy:       { bg:"#0d2b1a", border:"#22c55e", text:"#4ade80" },
-  Medium:     { bg:"#1a1a0a", border:"#eab308", text:"#facc15" },
-  Hard:       { bg:"#2a0d0d", border:"#ef4444", text:"#f87171" },
-  "Very Hard":{ bg:"#1a0d2a", border:"#a855f7", text:"#c084fc" },
-  Extreme:    { bg:"#2a1500", border:"#f97316", text:"#fb923c" },
+  Easy:        { bg:"#0d2b1a", border:"#22c55e", text:"#4ade80" },
+  Medium:      { bg:"#1a1a0a", border:"#eab308", text:"#facc15" },
+  Hard:        { bg:"#2a0d0d", border:"#ef4444", text:"#f87171" },
+  "Very Hard": { bg:"#1a0d2a", border:"#a855f7", text:"#c084fc" },
+  Extreme:     { bg:"#2a1500", border:"#f97316", text:"#fb923c" },
 };
+
+const MAX_WRONG_PER_LEVEL = 5;
+const LOCKOUT_MINUTES = 60; // match your contract
 
 function ParticleBg() {
   const canvasRef = useRef(null);
@@ -73,11 +79,22 @@ function ParticleBg() {
   return <canvas ref={canvasRef} style={{position:"fixed",top:0,left:0,zIndex:0,pointerEvents:"none"}}/>;
 }
 
+// ── Countdown display helper ──────────────────────────────────────────────────
+function fmt(sec) {
+  const h = Math.floor(sec/3600);
+  const m = Math.floor((sec%3600)/60);
+  const s = sec%60;
+  if(h>0) return `${h}h ${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
+  return `${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
+}
+
 export default function App() {
   const [page, setPage] = useState("home");
   const [wallet, setWallet] = useState("");
   const [entered, setEntered] = useState(false);
-  const [currentLevel, setCurrentLevel] = useState(0);
+
+  // ── Game state (all sourced from chain) ──────────────────────────────────
+  const [currentLevel, setCurrentLevel] = useState(0);  // 0-based index
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState(null);
   const [score, setScore] = useState(0);
@@ -85,27 +102,39 @@ export default function App() {
   const [wrongs, setWrongs] = useState(0);
   const [hintTokens, setHintTokens] = useState(2);
   const [partialHint, setPartialHint] = useState("");
-  const [lockout, setLockout] = useState(0);
+  const [lockout, setLockout] = useState(0);        // seconds remaining
   const [won, setWon] = useState(false);
+  const [wrongOnLevel, setWrongOnLevel] = useState(0);
+  const [gameStartedAt, setGameStartedAt] = useState(null); // JS Date or null
+  const [elapsed, setElapsed] = useState(0);               // seconds since entry
+  // The puzzle text fetched live from the contract for the player's current level
+  const [currentHint, setCurrentHint] = useState("");
+
+  // ── Global stats ─────────────────────────────────────────────────────────
   const [prizePool, setPrizePool] = useState("0");
   const [playerCount, setPlayerCount] = useState(0);
   const [leaderboard, setLeaderboard] = useState([]);
   const [winners, setWinners] = useState([]);
   const [loading, setLoading] = useState("");
-  // FIX: wrongOnLevel is now purely driven by chain data, not local counter
-  const [wrongOnLevel, setWrongOnLevel] = useState(0);
 
+  // ── Lockout countdown ────────────────────────────────────────────────────
   useEffect(()=>{
     if(lockout<=0) return;
     const t=setInterval(()=>setLockout(l=>Math.max(0,l-1)),1000);
     return()=>clearInterval(t);
   },[lockout]);
 
-  // FIX: auto-reload stats when wallet is set
+  // ── Elapsed game timer ───────────────────────────────────────────────────
   useEffect(()=>{
-    if(wallet) loadMyStats();
-  },[wallet]);
+    if(!gameStartedAt || won) return;
+    const t=setInterval(()=>setElapsed(Math.floor((Date.now()-gameStartedAt)/1000)),1000);
+    return()=>clearInterval(t);
+  },[gameStartedAt, won]);
 
+  // ── Auto-reload when wallet connects ─────────────────────────────────────
+  useEffect(()=>{ if(wallet) loadMyStatsForAddress(wallet); },[wallet]);
+
+  // ─────────────────────────────────────────────────────────────────────────
   const getContract = async (needSigner=false) => {
     if(!window.ethereum) throw new Error("MetaMask not found");
     const provider = new ethers.BrowserProvider(window.ethereum);
@@ -116,12 +145,28 @@ export default function App() {
     return new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
   };
 
+  // Fetch the puzzle hint for the player's current level directly from chain.
+  // getHint() returns the hint for msg.sender's currentLevel, so it's always
+  // in sync with on-chain state — no index mismatch possible.
+  const loadCurrentHint = async (levelIndex) => {
+    // levelIndex is 0-based (same as contract's currentLevel)
+    if(levelIndex >= LEVELS.length) return; // won — no more hints needed
+    try {
+      const c = await getContract();
+      // Use getHintForLevel(levelNumber) which is public — levelNumber is 1-based
+      const hint = await c.getHintForLevel(levelIndex + 1);
+      setCurrentHint(hint);
+    } catch(e) {
+      console.error("loadCurrentHint failed, using fallback:", e);
+      setCurrentHint(HINT_FALLBACK[levelIndex] || "");
+    }
+  };
+
   const connectWallet = async () => {
     if(!window.ethereum){ alert("Please install MetaMask!"); return; }
     const accounts = await window.ethereum.request({method:"eth_requestAccounts"});
     setWallet(accounts[0]);
     await loadGameStatus();
-    // FIX: load player stats right after connecting so level/hints are correct
     await loadMyStatsForAddress(accounts[0]);
   };
 
@@ -131,60 +176,69 @@ export default function App() {
       const status = await c.getGameStatus();
       setPrizePool(ethers.formatEther(status.prizePool));
       setPlayerCount(Number(status.playerCount));
-    } catch(e){ console.error(e); }
+    } catch(e){ console.error("loadGameStatus:", e); }
   };
 
-  // FIX: unified stats loader — reads from chain, sets all state correctly
+  // ── Central stats loader ──────────────────────────────────────────────────
+  // currentLevel from chain is 0-based (level 0 = first puzzle, level 10 = done)
+  const applyStats = async (stats, addr) => {
+    const lvl = Number(stats.currentLevel);          // 0-9 active, 10 = won
+    setCurrentLevel(lvl);
+    setAttempts(Number(stats.totalAttempts));
+    setWrongs(Number(stats.wrongAttempts));
+    setScore(Number(stats.score));
+    setHintTokens(Number(stats.hintTokensLeft));
+    setWon(stats.hasWon || lvl >= LEVELS.length);
+
+    if(stats.isLockedOut){
+      setLockout(Number(stats.lockoutSecondsRemaining));
+    } else {
+      setLockout(0);
+    }
+
+    // Reconstruct approximate game start time from secondsInGame
+    const secondsIn = Number(stats.secondsInGame || 0);
+    if(secondsIn > 0){
+      setGameStartedAt(Date.now() - secondsIn * 1000);
+      setElapsed(secondsIn);
+      setEntered(true);
+    }
+
+    if(Number(stats.totalAttempts) > 0 || lvl > 0 || Number(stats.score) > 0){
+      setEntered(true);
+    }
+
+    // Get wrongOnCurrentLevel from players mapping
+    if(addr){
+      try {
+        const c = await getContract();
+        const raw = await c.players(addr);
+        setWrongOnLevel(Number(raw.wrongOnCurrentLevel || 0));
+      } catch(_){}
+    }
+
+    // KEY FIX: fetch the actual puzzle text for this level from the contract
+    // so the question card always matches the player's real on-chain currentLevel
+    await loadCurrentHint(lvl);
+  };
+
   const loadMyStats = async () => {
     try {
       const c = await getContract();
       const stats = await c.getMyStats();
-      const lvl = Number(stats.currentLevel);
-      setCurrentLevel(lvl);
-      setAttempts(Number(stats.totalAttempts));
-      setWrongs(Number(stats.wrongAttempts));
-      setScore(Number(stats.score));
-      setHintTokens(Number(stats.hintTokensLeft));
-      setWon(stats.hasWon);
-      // FIX: get wrongOnCurrentLevel directly from contract storage
-      const c2 = await getContract();
-      try {
-        const raw = await c2.players(await (await (new ethers.BrowserProvider(window.ethereum)).getSigner()).getAddress());
-        setWrongOnLevel(Number(raw.wrongOnCurrentLevel));
-      } catch(_){}
-      if(stats.isLockedOut){
-        setLockout(Number(stats.lockoutSecondsRemaining));
-        setWrongOnLevel(0);
-      }
-      // FIX: if player has entered this round, mark entered
-      if(Number(stats.secondsInGame) > 0 || lvl > 0 || Number(stats.totalAttempts) > 0 || Number(stats.score) > 0){
-        setEntered(true);
-    }
-    } catch(e){ console.error(e); }
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const addr = await signer.getAddress();
+      await applyStats(stats, addr);
+    } catch(e){ console.error("loadMyStats:", e); }
   };
 
-  // FIX: load stats for a specific address right after connect
   const loadMyStatsForAddress = async (addr) => {
     try {
       const c = await getContract();
       const stats = await c.getMyStats();
-      const lvl = Number(stats.currentLevel);
-      setCurrentLevel(lvl);
-      setAttempts(Number(stats.totalAttempts));
-      setWrongs(Number(stats.wrongAttempts));
-      setScore(Number(stats.score));
-      setHintTokens(Number(stats.hintTokensLeft));
-      setWon(stats.hasWon);
-      if(stats.isLockedOut) setLockout(Number(stats.lockoutSecondsRemaining));
-      if(Number(stats.secondsInGame) > 0 || lvl > 0 || Number(stats.totalAttempts) > 0 || Number(stats.score) > 0){
-        setEntered(true);
-    }
-      // get wrongOnCurrentLevel
-      try {
-        const raw = await c.players(addr);
-        setWrongOnLevel(Number(raw.wrongOnCurrentLevel));
-      } catch(_){}
-    } catch(e){ console.error(e); }
+      await applyStats(stats, addr);
+    } catch(e){ console.error("loadMyStatsForAddress:", e); }
   };
 
   const loadLeaderboard = async () => {
@@ -217,6 +271,7 @@ export default function App() {
     } catch(e){ console.error(e); }
   };
 
+  // ── Actions ───────────────────────────────────────────────────────────────
   const handleEnter = async () => {
     try {
       setLoading("Entering game...");
@@ -225,8 +280,9 @@ export default function App() {
       setFeedback({type:"ok",msg:"⏳ Transaction sent, waiting..."});
       await tx.wait();
       setEntered(true);
+      setGameStartedAt(Date.now());
+      setElapsed(0);
       setFeedback({type:"ok",msg:"✅ Entered! 0.01 ETH paid. Good luck!"});
-      // FIX: reset all local state fresh for new player
       setCurrentLevel(0);
       setScore(0);
       setAttempts(0);
@@ -235,13 +291,13 @@ export default function App() {
       setWrongOnLevel(0);
       setWon(false);
       setPartialHint("");
+      setCurrentHint("");
       await loadMyStats();
       await loadGameStatus();
       setPage("game");
     } catch(e){
       const msg = e.reason || e.message || "";
       if(msg.includes("already entered")){
-        // FIX: already entered — just load stats and go to game
         setEntered(true);
         await loadMyStats();
         setPage("game");
@@ -260,21 +316,20 @@ export default function App() {
       const tx = await c.submitAnswer(answer.trim());
       setFeedback({type:"ok",msg:"⏳ Checking answer on chain..."});
       await tx.wait();
-      // FIX: clear answer and local wrong counter, then reload from chain
       setAnswer("");
       setWrongOnLevel(0);
       setPartialHint("");
+      setCurrentHint(""); // clear old puzzle while new one loads from chain
       setFeedback({type:"ok",msg:"✅ Correct! Moving to next level..."});
       await loadMyStats();
       await loadGameStatus();
     } catch(e){
       const msg = e.reason || e.message || "";
       if(msg.includes("wrong answer")){
-        // FIX: reload from chain to get accurate wrongOnCurrentLevel
-        setFeedback({type:"err",msg:`❌ Wrong answer. Try again!`});
+        setFeedback({type:"err",msg:"❌ Wrong answer. Try again!"});
         await loadMyStats();
       } else if(msg.includes("locked out")){
-        setFeedback({type:"err",msg:"🔒 Too many wrong answers. Locked out for 1 hour."});
+        setFeedback({type:"err",msg:`🔒 Too many wrong answers! Locked out for ${LOCKOUT_MINUTES} minutes.`});
         await loadMyStats();
       } else if(msg.includes("enter the game")){
         setFeedback({type:"err",msg:"❌ Please enter the game first."});
@@ -292,7 +347,6 @@ export default function App() {
       const tx = await c.useHintToken();
       await tx.wait();
       await loadMyStats();
-      // FIX: read hint from chain after using token
       const c2 = await getContract();
       const hint = await c2.getHint();
       setPartialHint("💡 " + hint);
@@ -302,20 +356,26 @@ export default function App() {
     } finally { setLoading(""); }
   };
 
-  // FIX: clamp currentLevel so it never goes out of bounds
-  const safeLevel = Math.min(currentLevel, LEVELS.length - 1);
-  const lvl = LEVELS[safeLevel];
-  const diffStyle = DIFF_COLOR[lvl.difficulty] || DIFF_COLOR.Easy;
-  const progressPct = (currentLevel / LEVELS.length) * 100;
-  // FIX: clamp wrongOnLevel to 0-5 so it never goes negative
-  const safeWrongOnLevel = Math.max(0, Math.min(5, wrongOnLevel));
+  // ── Derived display values ────────────────────────────────────────────────
+  // currentLevel is 0-based index into LEVELS[]. Level 10 means all done.
+  const isGameComplete = won || currentLevel >= LEVELS.length;
+  const safeLevel      = Math.min(currentLevel, LEVELS.length - 1);
+  const lvl            = LEVELS[safeLevel];
+  const diffStyle      = DIFF_COLOR[lvl.difficulty] || DIFF_COLOR.Easy;
+  const progressPct    = (currentLevel / LEVELS.length) * 100;
+  const safeWrong      = Math.max(0, Math.min(MAX_WRONG_PER_LEVEL, wrongOnLevel));
+  const attemptsLeft   = MAX_WRONG_PER_LEVEL - safeWrong;
+  const displayLevel   = currentLevel + 1;           // 1-based for humans
 
+  // ─────────────────────────────────────────────────────────────────────────
   return (
     <div style={{minHeight:"100vh",background:"#050508",fontFamily:"'Courier New',monospace",color:"#e2e8f0",position:"relative",overflowX:"hidden"}}>
       <style>{`
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
         @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
         @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
+        @keyframes lockBlink{0%,100%{background:rgba(239,68,68,.15)}50%{background:rgba(239,68,68,.35)}}
         *{box-sizing:border-box}
         input::placeholder{color:#333}
         input:focus{border-color:#00ffb4!important;outline:none;box-shadow:0 0 0 3px rgba(0,255,180,.1)}
@@ -326,7 +386,7 @@ export default function App() {
       `}</style>
       <ParticleBg/>
 
-      {/* NAV */}
+      {/* ── NAV ─────────────────────────────────────────────────────────── */}
       <nav style={{position:"sticky",top:0,zIndex:100,background:"rgba(5,5,8,.9)",backdropFilter:"blur(12px)",borderBottom:"1px solid #0d2b1a",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 32px",height:60}}>
         <div style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer"}} onClick={()=>setPage("home")}>
           <span style={{fontSize:26,color:"#00ffb4"}}>⬡</span>
@@ -334,7 +394,12 @@ export default function App() {
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
           {["home","game","leaderboard","winners"].map(p=>(
-            <button key={p} onClick={()=>{setPage(p);if(p==="leaderboard")loadLeaderboard();if(p==="winners")loadWinners();if(p==="game"&&wallet)loadMyStats();}} style={{background:page===p?"rgba(0,255,180,.1)":"transparent",border:`1px solid ${page===p?"#00ffb4":"#1a2a1a"}`,color:page===p?"#00ffb4":"#666",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,letterSpacing:.5,fontFamily:"'Courier New',monospace"}}>
+            <button key={p} onClick={()=>{
+              setPage(p);
+              if(p==="leaderboard") loadLeaderboard();
+              if(p==="winners")     loadWinners();
+              if(p==="game"&&wallet) loadMyStats();
+            }} style={{background:page===p?"rgba(0,255,180,.1)":"transparent",border:`1px solid ${page===p?"#00ffb4":"#1a2a1a"}`,color:page===p?"#00ffb4":"#666",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,letterSpacing:.5,fontFamily:"'Courier New',monospace"}}>
               {p==="home"?"🏠 Home":p==="game"?"🎮 Play":p==="leaderboard"?"📊 Board":"🏆 Winners"}
             </button>
           ))}
@@ -347,7 +412,7 @@ export default function App() {
 
       <main style={{position:"relative",zIndex:1,maxWidth:1000,margin:"0 auto",padding:"40px 24px 80px"}}>
 
-        {/* HOME */}
+        {/* ── HOME ──────────────────────────────────────────────────────── */}
         {page==="home" && (
           <div style={{textAlign:"center"}}>
             <div style={{display:"inline-block",background:"rgba(0,255,180,.1)",border:"1px solid #00ffb4",color:"#00ffb4",padding:"4px 16px",borderRadius:20,fontSize:11,letterSpacing:3,marginBottom:24}}>ROUND 1 · SEPOLIA TESTNET</div>
@@ -399,7 +464,7 @@ export default function App() {
           </div>
         )}
 
-        {/* GAME */}
+        {/* ── GAME ──────────────────────────────────────────────────────── */}
         {page==="game" && (
           <div style={{maxWidth:700,margin:"0 auto"}}>
             {!wallet?(
@@ -416,7 +481,7 @@ export default function App() {
                 <button onClick={handleEnter} style={{background:"linear-gradient(135deg,#00ffb4,#0ea5e9)",border:"none",color:"#050508",fontWeight:700,padding:"14px 32px",borderRadius:12,fontSize:15,cursor:"pointer",fontFamily:"'Courier New',monospace"}}>{loading||"⚡ Enter — 0.01 ETH"}</button>
                 {feedback&&<div style={{marginTop:16,color:feedback.type==="ok"?"#00ffb4":"#f87171"}}>{feedback.msg}</div>}
               </div>
-            ):won?(
+            ):isGameComplete?(
               <div style={{textAlign:"center",background:"rgba(250,204,21,.05)",border:"2px solid #facc15",borderRadius:16,padding:60}}>
                 <div style={{fontSize:80,animation:"float 2s infinite"}}>🏆</div>
                 <h1 style={{color:"#facc15",fontSize:42,margin:"16px 0 8px"}}>CHAMPION!</h1>
@@ -425,17 +490,32 @@ export default function App() {
                   <div style={{fontSize:32,fontWeight:700,color:"#00ffb4"}}>{score.toLocaleString()}</div>
                   <div style={{fontSize:11,color:"#555",letterSpacing:1}}>FINAL SCORE</div>
                 </div>
+                <div style={{color:"#888",fontSize:14,marginTop:8}}>Time: {fmt(elapsed)}</div>
                 <p style={{color:"#888"}}>Prize sent to your wallet automatically!</p>
               </div>
             ):(
               <>
-                {/* HUD */}
-                <div style={{display:"flex",gap:12,marginBottom:20,flexWrap:"wrap"}}>
+                {/* ── LOCKOUT BANNER ────────────────────────────────────── */}
+                {lockout>0&&(
+                  <div style={{animation:"lockBlink 1.5s infinite",border:"2px solid #ef4444",borderRadius:14,padding:"18px 24px",marginBottom:20,textAlign:"center"}}>
+                    <div style={{fontSize:32,marginBottom:6}}>🔒</div>
+                    <div style={{color:"#f87171",fontSize:20,fontWeight:700,letterSpacing:2}}>LOCKED OUT</div>
+                    <div style={{color:"#fca5a5",fontSize:14,marginTop:4}}>Too many wrong answers on this level</div>
+                    <div style={{color:"#ef4444",fontSize:36,fontWeight:900,marginTop:8,letterSpacing:4,fontVariantNumeric:"tabular-nums"}}>
+                      {fmt(lockout)}
+                    </div>
+                    <div style={{color:"#555",fontSize:12,marginTop:4}}>remaining before you can try again</div>
+                  </div>
+                )}
+
+                {/* ── HUD ───────────────────────────────────────────────── */}
+                <div style={{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}}>
                   {[
                     {icon:"⭐",val:score.toLocaleString(),lbl:"Score"},
-                    {icon:"📈",val:`${currentLevel}/10`,lbl:"Level"},
+                    // FIX: show displayLevel (1-based) correctly
+                    {icon:"📈",val:`${displayLevel}/10`,lbl:"Level"},
                     {icon:"🎯",val:`${attempts>0?Math.round(((attempts-wrongs)/attempts)*100):100}%`,lbl:"Accuracy"},
-                    {icon:"💡",val:hintTokens,lbl:"Hints"}
+                    {icon:"💡",val:hintTokens,lbl:"Hints Left"},
                   ].map(h=>(
                     <div key={h.lbl} style={{background:"rgba(255,255,255,.03)",border:"1px solid #1a2a1a",borderRadius:10,padding:"10px 16px",display:"flex",flexDirection:"column",alignItems:"center",gap:2,flex:1,minWidth:70}}>
                       <span style={{fontSize:18}}>{h.icon}</span>
@@ -443,52 +523,80 @@ export default function App() {
                       <span style={{fontSize:10,color:"#555",letterSpacing:1}}>{h.lbl}</span>
                     </div>
                   ))}
-                  {lockout>0&&(
-                    <div style={{background:"rgba(239,68,68,.1)",border:"1px solid #ef4444",borderRadius:10,padding:"10px 16px",display:"flex",flexDirection:"column",alignItems:"center",gap:2,flex:1,minWidth:70}}>
-                      <span style={{fontSize:18}}>🔒</span>
-                      <span style={{fontSize:18,fontWeight:700,color:"#f87171"}}>{Math.ceil(lockout/60)}m</span>
-                      <span style={{fontSize:10,color:"#f87171",letterSpacing:1}}>LOCKED</span>
-                    </div>
-                  )}
+                  {/* ── GAME TIMER ────── */}
+                  <div style={{background:"rgba(14,165,233,.07)",border:"1px solid #0369a1",borderRadius:10,padding:"10px 16px",display:"flex",flexDirection:"column",alignItems:"center",gap:2,flex:1,minWidth:70}}>
+                    <span style={{fontSize:18}}>⏱</span>
+                    <span style={{fontSize:16,fontWeight:700,color:"#38bdf8",fontVariantNumeric:"tabular-nums"}}>{fmt(elapsed)}</span>
+                    <span style={{fontSize:10,color:"#555",letterSpacing:1}}>TIME</span>
+                  </div>
                 </div>
 
-                {/* Progress */}
+                {/* ── PROGRESS BAR ──────────────────────────────────────── */}
                 <div style={{position:"relative",height:6,background:"#1a1a1a",borderRadius:3,marginBottom:28}}>
                   <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${progressPct}%`,borderRadius:3,background:"linear-gradient(90deg,#00ffb4,#0ea5e9)",transition:"width .4s ease"}}/>
                 </div>
 
-                {/* Level card */}
+                {/* ── LEVEL CARD ────────────────────────────────────────── */}
                 <div style={{border:`1px solid ${diffStyle.border}`,borderRadius:16,padding:28,background:`linear-gradient(135deg,${diffStyle.bg} 0%,#0a0a0f 100%)`}}>
                   <div style={{marginBottom:20}}>
                     <span style={{border:`1px solid ${diffStyle.border}`,borderRadius:6,padding:"3px 10px",fontSize:11,letterSpacing:2,fontWeight:700,color:diffStyle.text,background:diffStyle.bg,marginRight:12}}>{lvl.difficulty.toUpperCase()}</span>
-                    <span style={{color:"#555",fontSize:13,letterSpacing:2}}>LEVEL {currentLevel+1} / 10</span>
+                    {/* FIX: correct level display — displayLevel is 1-based */}
+                    <span style={{color:"#555",fontSize:13,letterSpacing:2}}>LEVEL {displayLevel} / 10</span>
                     <div style={{color:"#e2e8f0",fontSize:18,fontWeight:700,marginTop:8}}>{lvl.topic}</div>
                   </div>
 
                   <div style={{background:"rgba(0,0,0,.4)",border:"1px solid #1a1a2a",borderRadius:10,padding:"16px 20px",marginBottom:16}}>
-                    <pre style={{color:"#94a3b8",fontSize:14,lineHeight:1.8,whiteSpace:"pre-wrap",fontFamily:"'Courier New',monospace",margin:0}}>{HINTS[safeLevel]}</pre>
+                    {currentHint
+                      ? <pre style={{color:"#94a3b8",fontSize:14,lineHeight:1.8,whiteSpace:"pre-wrap",fontFamily:"'Courier New',monospace",margin:0}}>{currentHint}</pre>
+                      : <div style={{color:"#555",fontSize:13,textAlign:"center",padding:"8px 0",animation:"pulse 1s infinite"}}>⏳ Loading puzzle…</div>
+                    }
                   </div>
 
                   {partialHint&&(
                     <div style={{background:"rgba(250,204,21,.07)",border:"1px solid #713f12",borderRadius:8,padding:"10px 16px",marginBottom:16,color:"#fde68a",fontSize:13}}>{partialHint}</div>
                   )}
 
-                  {/* FIX: only show attempt boxes if there are actual wrong attempts, use safeWrongOnLevel */}
-                  {safeWrongOnLevel>0&&(
-                    <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
-                      {Array.from({length:5}).map((_,i)=>(
-                        <div key={i} style={{width:28,height:28,borderRadius:6,background:i<safeWrongOnLevel?"#ef4444":"#1a1a1a",border:`1px solid ${i<safeWrongOnLevel?"#dc2626":"#333"}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>
-                          {i<safeWrongOnLevel?"✗":"○"}
-                        </div>
-                      ))}
-                      <span style={{color:"#f87171",fontSize:12,marginLeft:8}}>{5-safeWrongOnLevel} attempts before lockout</span>
+                  {/* ── ATTEMPT TRACKER ───────────────────────────────────
+                      Always show so players know how many chances they have */}
+                  <div style={{marginBottom:16}}>
+                    <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                      {Array.from({length:MAX_WRONG_PER_LEVEL}).map((_,i)=>{
+                        const isUsed = i < safeWrong;
+                        const isLast = i === MAX_WRONG_PER_LEVEL - 1;
+                        return (
+                          <div key={i} style={{
+                            width:32, height:32, borderRadius:8,
+                            background: isUsed ? (isLast ? "#7f1d1d" : "#991b1b") : "#1a1a1a",
+                            border:`1px solid ${isUsed ? (isLast?"#ef4444":"#dc2626") : "#2a2a2a"}`,
+                            display:"flex",alignItems:"center",justifyContent:"center",
+                            fontSize:16, transition:"all .2s",
+                            boxShadow: isUsed ? "0 0 8px rgba(239,68,68,.3)" : "none",
+                          }}>
+                            {isUsed ? "✗" : "○"}
+                          </div>
+                        );
+                      })}
+                      <span style={{
+                        marginLeft:10, fontSize:13,
+                        color: attemptsLeft<=1 ? "#ef4444" : attemptsLeft<=2 ? "#f97316" : "#94a3b8",
+                        fontWeight: attemptsLeft<=2 ? 700 : 400,
+                        animation: attemptsLeft<=1 ? "pulse 1s infinite" : "none",
+                      }}>
+                        {attemptsLeft === 0
+                          ? "⛔ Locking out now…"
+                          : attemptsLeft === 1
+                          ? `⚠️ LAST ATTEMPT — then locked ${LOCKOUT_MINUTES}m!`
+                          : `${attemptsLeft} attempt${attemptsLeft!==1?"s":""} left before ${LOCKOUT_MINUTES}m lockout`
+                        }
+                      </span>
                     </div>
-                  )}
+                  </div>
 
+                  {/* ── INPUT ROW ─────────────────────────────────────────── */}
                   <div style={{display:"flex",gap:10,marginBottom:12}}>
                     <input
-                      style={{flex:1,background:"rgba(0,0,0,.5)",border:"1px solid #334",borderRadius:10,padding:"14px 16px",color:"#e2e8f0",fontSize:16,fontFamily:"'Courier New',monospace",opacity:lockout>0?0.5:1}}
-                      placeholder={lockout>0?`🔒 Locked — ${Math.ceil(lockout/60)}m`:"Type your answer…"}
+                      style={{flex:1,background:"rgba(0,0,0,.5)",border:"1px solid #334",borderRadius:10,padding:"14px 16px",color:"#e2e8f0",fontSize:16,fontFamily:"'Courier New',monospace",opacity:lockout>0?0.4:1}}
+                      placeholder={lockout>0?`🔒 Locked — ${fmt(lockout)}`:"Type your answer…"}
                       value={answer}
                       onChange={e=>setAnswer(e.target.value)}
                       onKeyDown={e=>e.key==="Enter"&&!lockout&&!loading&&handleSubmit()}
@@ -497,20 +605,34 @@ export default function App() {
                     <button
                       onClick={handleSubmit}
                       disabled={lockout>0||!!loading}
-                      style={{background:lockout>0?"#333":diffStyle.border,border:"none",color:"#050508",fontWeight:700,padding:"14px 24px",borderRadius:10,fontSize:14,cursor:lockout>0?"not-allowed":"pointer",fontFamily:"'Courier New',monospace",opacity:loading?0.6:1}}
+                      style={{background:lockout>0?"#333":diffStyle.border,border:"none",color:"#050508",fontWeight:700,padding:"14px 24px",borderRadius:10,fontSize:14,cursor:lockout>0?"not-allowed":"pointer",fontFamily:"'Courier New',monospace",opacity:loading?0.6:1,minWidth:100}}
                     >
                       {loading?"⏳":"Submit ↵"}
                     </button>
                   </div>
 
+                  {/* ── HINT BUTTON ───────────────────────────────────────── */}
                   <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
-                    <button
-                      onClick={handleHint}
-                      disabled={hintTokens<=0||!!loading}
-                      style={{background:"rgba(250,204,21,.08)",border:"1px solid #713f12",color:"#fde68a",padding:"8px 16px",borderRadius:8,fontSize:12,fontFamily:"'Courier New',monospace",cursor:hintTokens>0?"pointer":"not-allowed",opacity:hintTokens>0?1:0.4}}
-                    >
-                      💡 Use Hint Token ({hintTokens} left)
-                    </button>
+                    <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                      <button
+                        onClick={handleHint}
+                        disabled={hintTokens<=0||!!loading}
+                        style={{
+                          background: hintTokens>0 ? "rgba(250,204,21,.12)" : "rgba(255,255,255,.03)",
+                          border:`1px solid ${hintTokens>0?"#a16207":"#222"}`,
+                          color: hintTokens>0 ? "#fde68a" : "#444",
+                          padding:"8px 16px",borderRadius:8,fontSize:12,
+                          fontFamily:"'Courier New',monospace",
+                          cursor:hintTokens>0?"pointer":"not-allowed",
+                          transition:"all .2s",
+                        }}
+                      >
+                        💡 Use Hint Token ({hintTokens} left)
+                      </button>
+                      {hintTokens===0&&(
+                        <span style={{color:"#555",fontSize:11}}>No hint tokens remaining</span>
+                      )}
+                    </div>
                     <span style={{color:"#555",fontSize:12}}>Case insensitive ✓</span>
                   </div>
 
@@ -525,7 +647,7 @@ export default function App() {
           </div>
         )}
 
-        {/* LEADERBOARD */}
+        {/* ── LEADERBOARD ───────────────────────────────────────────────── */}
         {page==="leaderboard" && (
           <div>
             <div style={{color:"#555",fontSize:11,letterSpacing:4,marginBottom:16,borderBottom:"1px solid #111",paddingBottom:8}}>📊 LIVE LEADERBOARD</div>
@@ -555,7 +677,7 @@ export default function App() {
           </div>
         )}
 
-        {/* WINNERS */}
+        {/* ── WINNERS ───────────────────────────────────────────────────── */}
         {page==="winners" && (
           <div>
             <div style={{color:"#555",fontSize:11,letterSpacing:4,marginBottom:16,borderBottom:"1px solid #111",paddingBottom:8}}>🏆 WINNER HISTORY</div>
