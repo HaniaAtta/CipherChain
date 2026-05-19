@@ -278,7 +278,7 @@ export default function App() {
         score,
         attempts:     total,
         wrongs:       wrong,
-        wrongOnLevel,
+      wrongOnLevel: lockoutSecs > 0 ? MAX_WRONG_PER_LEVEL : wrongOnLevel,
         hintTokens,
         lockout:      lockoutSecs,
         won:          hasWon,
