@@ -88,6 +88,51 @@ function fmt(sec) {
   return `${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
 }
 
+// ── Owner sub-component: set round duration ───────────────────────────────
+function RoundDurationControl({ ownerLoading, onSet }) {
+  const [hours, setHours]     = useState("24");
+  const [minutes, setMinutes] = useState("0");
+  const inputStyle = {
+    background:"rgba(0,0,0,.4)", border:"1px solid #334", borderRadius:8,
+    padding:"10px 12px", color:"#e2e8f0", fontSize:15, width:80,
+    fontFamily:"'Courier New',monospace", textAlign:"center",
+  };
+  const totalSecs = (parseInt(hours||0,10)*3600) + (parseInt(minutes||0,10)*60);
+  return (
+    <div style={{border:"1px solid #0ea5e9",borderRadius:14,padding:24,background:"rgba(14,165,233,.05)"}}>
+      <div style={{color:"#38bdf8",fontWeight:700,fontSize:16,marginBottom:6}}>⏱ Set Round Duration</div>
+      <div style={{color:"#888",fontSize:13,marginBottom:16}}>
+        Sets a deadline from now. Players cannot submit after expiry. Set to 0 for no deadline.
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <input style={inputStyle} type="number" min="0" max="720" value={hours}
+            onChange={e=>setHours(e.target.value)} placeholder="hrs"/>
+          <span style={{color:"#555"}}>h</span>
+          <input style={inputStyle} type="number" min="0" max="59" value={minutes}
+            onChange={e=>setMinutes(e.target.value)} placeholder="min"/>
+          <span style={{color:"#555"}}>m</span>
+        </div>
+        <button
+          onClick={()=>onSet(totalSecs)}
+          disabled={!!ownerLoading}
+          style={{background:"rgba(14,165,233,.15)",border:"1px solid #0ea5e9",color:"#38bdf8",fontWeight:700,padding:"10px 20px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"'Courier New',monospace",opacity:ownerLoading?"0.5":"1"}}
+        >
+          {ownerLoading==="Set Round Duration"?"⏳…":"✅ Set Deadline"}
+        </button>
+        <button
+          onClick={()=>onSet(0)}
+          disabled={!!ownerLoading}
+          style={{background:"rgba(255,255,255,.03)",border:"1px solid #334",color:"#666",padding:"10px 16px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"'Courier New',monospace"}}
+        >
+          ✕ Clear
+        </button>
+        {totalSecs>0&&<span style={{color:"#555",fontSize:12}}>{Math.floor(totalSecs/3600)}h {Math.floor((totalSecs%3600)/60)}m from now</span>}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState("home");
   const [wallet, setWallet] = useState("");
@@ -104,6 +149,7 @@ export default function App() {
   const [partialHint, setPartialHint] = useState("");
   const [lockout, setLockout] = useState(0);        // seconds remaining
   const [won, setWon] = useState(false);
+  const hasWonRef = useRef(false); // sync ref — never stale unlike useState
   const [wrongOnLevel, setWrongOnLevel] = useState(0);
   const [gameStartedAt, setGameStartedAt] = useState(null); // JS Date or null
   const [elapsed, setElapsed] = useState(0);               // seconds since entry
@@ -116,6 +162,9 @@ export default function App() {
   const [leaderboard, setLeaderboard] = useState([]);
   const [winners, setWinners] = useState([]);
   const [loading, setLoading] = useState("");
+  const [isOwner, setIsOwner] = useState(false);
+  const [ownerFeedback, setOwnerFeedback] = useState(null);
+  const [ownerLoading, setOwnerLoading] = useState("");
 
   // ── Lockout countdown ────────────────────────────────────────────────────
   useEffect(()=>{
@@ -168,6 +217,12 @@ export default function App() {
     setWallet(accounts[0]);
     await loadGameStatus();
     await loadMyStatsForAddress(accounts[0]);
+    // Check if connected wallet is the contract owner
+    try {
+      const c = await getContract();
+      const contractOwner = await c.owner();
+      setIsOwner(contractOwner.toLowerCase() === accounts[0].toLowerCase());
+    } catch(e){ console.error("owner check:", e); }
   };
 
   const loadGameStatus = async () => {
@@ -188,7 +243,9 @@ export default function App() {
     setWrongs(Number(stats.wrongAttempts));
     setScore(Number(stats.score));
     setHintTokens(Number(stats.hintTokensLeft));
-    setWon(stats.hasWon || lvl >= LEVELS.length);
+    const didWin = stats.hasWon || lvl >= LEVELS.length;
+    hasWonRef.current = didWin;   // sync — always up to date for this render
+    setWon(didWin);
 
     if(stats.isLockedOut){
       setLockout(Number(stats.lockoutSecondsRemaining));
@@ -290,6 +347,7 @@ export default function App() {
       setHintTokens(2);
       setWrongOnLevel(0);
       setWon(false);
+      hasWonRef.current = false;
       setPartialHint("");
       setCurrentHint("");
       await loadMyStats();
@@ -325,7 +383,11 @@ export default function App() {
       await loadGameStatus();
     } catch(e){
       const msg = e.reason || e.message || "";
-      if(msg.includes("wrong answer")){
+      if(msg.includes("already won")){
+        // Player has already won — reload stats which will set won=true and show winner screen
+        await loadMyStats();
+        setFeedback(null);
+      } else if(msg.includes("wrong answer")){
         setFeedback({type:"err",msg:"❌ Wrong answer. Try again!"});
         await loadMyStats();
       } else if(msg.includes("locked out")){
@@ -356,16 +418,50 @@ export default function App() {
     } finally { setLoading(""); }
   };
 
+  // ── Owner actions ─────────────────────────────────────────────────────────
+  const ownerAction = async (label, fn) => {
+    setOwnerFeedback(null);
+    setOwnerLoading(label);
+    try {
+      const c = await getContract(true);
+      const tx = await fn(c);
+      setOwnerFeedback({type:"ok", msg:`⏳ ${label} — waiting for confirmation…`});
+      await tx.wait();
+      await loadGameStatus();
+      await loadLeaderboard();
+      setOwnerFeedback({type:"ok", msg:`✅ ${label} complete!`});
+    } catch(e) {
+      setOwnerFeedback({type:"err", msg:`❌ ${e.reason || e.message}`});
+    } finally { setOwnerLoading(""); }
+  };
+
+  const handleResetRound = () => ownerAction(
+    "Reset Round",
+    (c) => c.resetRound()
+  );
+
+  const handlePause   = (p) => ownerAction(
+    p ? "Pause Game" : "Unpause Game",
+    (c) => c.setPaused(p)
+  );
+
+  const handleSetDuration = (secs) => ownerAction(
+    "Set Round Duration",
+    (c) => c.setRoundDuration(secs)
+  );
+
   // ── Derived display values ────────────────────────────────────────────────
-  // currentLevel is 0-based index into LEVELS[]. Level 10 means all done.
-  const isGameComplete = won || currentLevel >= LEVELS.length;
+  // isGameComplete uses the ref (never stale) OR state (for normal renders).
+  // This prevents the "already won" error showing instead of the winner screen.
+  const isGameComplete = won || hasWonRef.current || currentLevel >= LEVELS.length;
   const safeLevel      = Math.min(currentLevel, LEVELS.length - 1);
   const lvl            = LEVELS[safeLevel];
   const diffStyle      = DIFF_COLOR[lvl.difficulty] || DIFF_COLOR.Easy;
-  const progressPct    = (currentLevel / LEVELS.length) * 100;
+  const progressPct    = Math.min((currentLevel / LEVELS.length) * 100, 100);
   const safeWrong      = Math.max(0, Math.min(MAX_WRONG_PER_LEVEL, wrongOnLevel));
   const attemptsLeft   = MAX_WRONG_PER_LEVEL - safeWrong;
-  const displayLevel   = currentLevel + 1;           // 1-based for humans
+  // Cap displayLevel at 10 so it never shows "11/10"
+  const displayLevel   = Math.min(currentLevel + 1, LEVELS.length);
 
   // ─────────────────────────────────────────────────────────────────────────
   return (
@@ -393,14 +489,14 @@ export default function App() {
           <span style={{fontSize:20,fontWeight:700,letterSpacing:2,color:"#00ffb4"}}>CipherChain</span>
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          {["home","game","leaderboard","winners"].map(p=>(
+          {["home","game","leaderboard","winners",...(isOwner?["admin"]:[])].map(p=>(
             <button key={p} onClick={()=>{
               setPage(p);
               if(p==="leaderboard") loadLeaderboard();
               if(p==="winners")     loadWinners();
               if(p==="game"&&wallet) loadMyStats();
-            }} style={{background:page===p?"rgba(0,255,180,.1)":"transparent",border:`1px solid ${page===p?"#00ffb4":"#1a2a1a"}`,color:page===p?"#00ffb4":"#666",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,letterSpacing:.5,fontFamily:"'Courier New',monospace"}}>
-              {p==="home"?"🏠 Home":p==="game"?"🎮 Play":p==="leaderboard"?"📊 Board":"🏆 Winners"}
+            }} style={{background:page===p?"rgba(0,255,180,.1)":"transparent",border:`1px solid ${page===p?(p==="admin"?"#f97316":"#00ffb4"):"#1a2a1a"}`,color:page===p?(p==="admin"?"#fb923c":"#00ffb4"):"#666",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,letterSpacing:.5,fontFamily:"'Courier New',monospace"}}>
+              {p==="home"?"🏠 Home":p==="game"?"🎮 Play":p==="leaderboard"?"📊 Board":p==="admin"?"⚙️ Admin":"🏆 Winners"}
             </button>
           ))}
           {wallet
@@ -677,7 +773,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ── WINNERS ─────────────────────────────────────────────── */}
+        {/* ── WINNERS ───────────────────────────────────────────────────── */}
         {page==="winners" && (
           <div>
             <div style={{color:"#555",fontSize:11,letterSpacing:4,marginBottom:16,borderBottom:"1px solid #111",paddingBottom:8}}>🏆 WINNER HISTORY</div>
@@ -697,6 +793,92 @@ export default function App() {
                 </div>
               ))
             }
+          </div>
+        )}
+        {/* ── ADMIN PANEL ───────────────────────────────────────────────── */}
+        {page==="admin" && isOwner && (
+          <div style={{maxWidth:680,margin:"0 auto"}}>
+            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:28}}>
+              <span style={{fontSize:28}}>⚙️</span>
+              <div>
+                <div style={{color:"#fb923c",fontSize:20,fontWeight:700,letterSpacing:2}}>OWNER PANEL</div>
+                <div style={{color:"#555",fontSize:12}}>Actions execute on-chain and affect all players</div>
+              </div>
+            </div>
+
+            {ownerFeedback&&(
+              <div style={{border:"1px solid",borderRadius:10,padding:"12px 16px",marginBottom:20,fontSize:14,background:ownerFeedback.type==="ok"?"rgba(0,255,180,.08)":"rgba(239,68,68,.08)",borderColor:ownerFeedback.type==="ok"?"#00ffb4":"#ef4444",color:ownerFeedback.type==="ok"?"#00ffb4":"#f87171"}}>
+                {ownerFeedback.msg}
+              </div>
+            )}
+
+            {/* ── Live stats strip ── */}
+            <div style={{display:"flex",gap:12,marginBottom:24,flexWrap:"wrap"}}>
+              {[
+                {label:"Prize Pool",   val:`${prizePool} ETH`, color:"#facc15"},
+                {label:"Players",      val:playerCount,        color:"#00ffb4"},
+                {label:"Leaderboard",  val:`${leaderboard.length} entries`, color:"#94a3b8"},
+              ].map(s=>(
+                <div key={s.label} style={{flex:1,minWidth:120,background:"rgba(255,255,255,.03)",border:"1px solid #1a2a1a",borderRadius:10,padding:"14px 18px",textAlign:"center"}}>
+                  <div style={{fontSize:20,fontWeight:700,color:s.color}}>{s.val}</div>
+                  <div style={{fontSize:11,color:"#555",letterSpacing:1,marginTop:4}}>{s.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* ── Reset Round ── */}
+            <div style={{border:"2px solid #ef4444",borderRadius:14,padding:24,marginBottom:16,background:"rgba(239,68,68,.05)"}}>
+              <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:16,flexWrap:"wrap"}}>
+                <div>
+                  <div style={{color:"#f87171",fontWeight:700,fontSize:16,marginBottom:6}}>🔄 Reset Round</div>
+                  <div style={{color:"#888",fontSize:13,lineHeight:1.6,maxWidth:380}}>
+                    Clears <strong style={{color:"#e2e8f0"}}>all player progress</strong>, the leaderboard, and winner history.
+                    Increments the round counter. The prize pool must be empty first
+                    (pay out winners or use Force Reset below).
+                  </div>
+                  <div style={{marginTop:10,padding:"8px 12px",background:"rgba(239,68,68,.1)",borderRadius:8,fontSize:12,color:"#fca5a5",border:"1px solid #7f1d1d"}}>
+                    ⚠️ This is irreversible. All player data for round {"{current}"} will be wiped.
+                  </div>
+                </div>
+                <button
+                  onClick={()=>{ if(window.confirm("Reset the round? This wipes ALL player data and the leaderboard. Cannot be undone.")) handleResetRound(); }}
+                  disabled={!!ownerLoading}
+                  style={{background:"#ef4444",border:"none",color:"#fff",fontWeight:700,padding:"12px 24px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"'Courier New',monospace",whiteSpace:"nowrap",opacity:ownerLoading?"0.5":"1",minWidth:140}}
+                >
+                  {ownerLoading==="Reset Round"?"⏳ Resetting…":"🔄 Reset Round"}
+                </button>
+              </div>
+            </div>
+
+            {/* ── Pause / Unpause ── */}
+            <div style={{border:"1px solid #a855f7",borderRadius:14,padding:24,marginBottom:16,background:"rgba(168,85,247,.05)"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:16,flexWrap:"wrap"}}>
+                <div>
+                  <div style={{color:"#c084fc",fontWeight:700,fontSize:16,marginBottom:6}}>⏸ Pause / Resume Game</div>
+                  <div style={{color:"#888",fontSize:13}}>Prevents new entries and answer submissions while paused.</div>
+                </div>
+                <div style={{display:"flex",gap:10}}>
+                  <button
+                    onClick={()=>handlePause(true)}
+                    disabled={!!ownerLoading}
+                    style={{background:"rgba(168,85,247,.2)",border:"1px solid #a855f7",color:"#c084fc",fontWeight:700,padding:"10px 20px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"'Courier New',monospace",opacity:ownerLoading?"0.5":"1"}}
+                  >
+                    {ownerLoading==="Pause Game"?"⏳…":"⏸ Pause"}
+                  </button>
+                  <button
+                    onClick={()=>handlePause(false)}
+                    disabled={!!ownerLoading}
+                    style={{background:"rgba(0,255,180,.1)",border:"1px solid #00ffb4",color:"#00ffb4",fontWeight:700,padding:"10px 20px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"'Courier New',monospace",opacity:ownerLoading?"0.5":"1"}}
+                  >
+                    {ownerLoading==="Unpause Game"?"⏳…":"▶️ Resume"}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* ── Set Round Duration ── */}
+            <RoundDurationControl ownerLoading={ownerLoading} onSet={handleSetDuration}/>
+
           </div>
         )}
       </main>
