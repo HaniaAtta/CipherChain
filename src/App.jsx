@@ -356,7 +356,7 @@ setFeedback({ type:"err", msg:`❌ Wrong answer. ${MAX_WRONG_PER_LEVEL - newWron
 await new Promise(r => setTimeout(r, FLASH_MS + 300));
 const prevWrong = newWrong;
 const prevLockout = willLock ? LOCKOUT_MINUTES * 60 : 0;
-await refreshAll(wallet);
+if (!willLock) await refreshAll(wallet);
 // preserve lockout and wrongOnLevel if chain hasn't confirmed yet
 setGs(g => ({
   ...g,
