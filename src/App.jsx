@@ -348,14 +348,17 @@ export default function App() {
       } else if (raw.includes("wrong") || raw.includes("incorrect") || raw.includes("invalid answer") || raw.includes("not correct") || raw.includes("answer")) {
         triggerFlash(flashSlot);
         // Optimistic local increment
-        setGs(g => {
-          const nw       = Math.min(g.wrongOnLevel + 1, MAX_WRONG_PER_LEVEL);
-          const willLock = nw >= MAX_WRONG_PER_LEVEL;
-          return { ...g, wrongOnLevel: nw, lockout: willLock ? LOCKOUT_MINUTES * 60 : g.lockout };
-        });
-        setFeedback({ type:"err", msg:"❌ Wrong answer. Try again!" });
-        await new Promise(r => setTimeout(r, FLASH_MS + 300));
-        await refreshAll(wallet);
+       const newWrong = Math.min(gs.wrongOnLevel + 1, MAX_WRONG_PER_LEVEL);
+const willLock = newWrong >= MAX_WRONG_PER_LEVEL;
+setGs(g => ({ ...g, wrongOnLevel: newWrong, lockout: willLock ? LOCKOUT_MINUTES * 60 : g.lockout }));
+setFeedback({ type:"err", msg:`❌ Wrong answer. ${MAX_WRONG_PER_LEVEL - newWrong} attempt${MAX_WRONG_PER_LEVEL - newWrong !== 1 ? "s" : ""} left before lockout!` });
+await new Promise(r => setTimeout(r, FLASH_MS + 300));
+// refresh but preserve wrongOnLevel if chain resets it
+const prevWrong = newWrong;
+await refreshAll(wallet);
+setGs(g => ({ ...g, wrongOnLevel: g.wrongOnLevel > 0 ? g.wrongOnLevel : prevWrong }));
+
+
 
       } else if (raw.includes("already won")) {
         setFeedback({ type:"ok", msg:"🏆 You already won this round!" });
@@ -471,30 +474,26 @@ export default function App() {
 
   // ── Force reset: drain ETH first then resetRound, bypassing prize-pool guard ─
   const handleForceReset = async () => {
-    if (!window.confirm("⚠️ FORCE RESET: Drain prize pool to owner and wipe ALL player data now? Cannot be undone.")) return;
-    setOwnerFeedback(null); setOwnerLoading("Force Reset");
+  if (!window.confirm("⚠️ FORCE RESET: This will wipe all player data. Prize pool must be 0 or use expireRound first. Continue?")) return;
+  setOwnerFeedback(null); setOwnerLoading("Force Reset");
+  try {
+    const c = await getContract(true);
+    // Step 1: try expireRound to zero out prize pool if deadline set
     try {
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const signer   = await provider.getSigner();
-      const iface    = new ethers.Interface(ABI);
+      const tx1 = await c.expireRound();
+      await tx1.wait();
+    } catch (e) { console.warn("expireRound skipped:", e.message); }
+    // Step 2: resetRound
+    const tx2 = await c.resetRound();
+    setOwnerFeedback({ type:"ok", msg:"⏳ Resetting round…" });
+    await tx2.wait();
+    await refreshAll(wallet);
+    setOwnerFeedback({ type:"ok", msg:"✅ Round reset! New round started." });
+  } catch (e) {
+    setOwnerFeedback({ type:"err", msg:`❌ Reset failed: ${e.reason || e.message}. If players are in game, prize pool must be 0 first — call expireRound or wait for a winner.` });
+  } finally { setOwnerLoading(""); }
+};
 
-      // Step 1 — try emergencyWithdraw to empty the prize pool (ignore if function missing or already 0)
-      try {
-        const tx1 = await signer.sendTransaction({ to:CONTRACT_ADDRESS, data:iface.encodeFunctionData("emergencyWithdraw"), gasLimit:300000n });
-        await tx1.wait();
-      } catch (e) { console.warn("emergencyWithdraw skipped:", e.message); }
-
-      // Step 2 — resetRound should now succeed since pool is 0
-      const tx2 = await signer.sendTransaction({ to:CONTRACT_ADDRESS, data:iface.encodeFunctionData("resetRound"), gasLimit:500000n });
-      setOwnerFeedback({ type:"ok", msg:"⏳ Force reset tx sent — confirming…" });
-      await tx2.wait();
-
-      await refreshAll(wallet); await loadLeaderboard();
-      setOwnerFeedback({ type:"ok", msg:"✅ Force reset complete! All player data wiped." });
-    } catch (e) {
-      setOwnerFeedback({ type:"err", msg:`❌ Force reset failed: ${e.reason || e.message}` });
-    } finally { setOwnerLoading(""); }
-  };
 
   // ── Derived display ────────────────────────────────────────────────────────
   const isGameComplete = gs.won || gs.currentLevel >= LEVELS.length;
