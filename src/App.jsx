@@ -722,13 +722,13 @@ setGs(g => ({ ...g, wrongOnLevel: g.wrongOnLevel > 0 ? g.wrongOnLevel : prevWron
                   <div style={{ display:"flex", gap:10, marginBottom:12 }}>
                     <input
                       style={{ flex:1, background:"rgba(0,0,0,.5)", border:"1px solid #334", borderRadius:10, padding:"14px 16px", color:"#e2e8f0", fontSize:16, fontFamily:"'Courier New',monospace", opacity:gs.lockout>0?0.4:1 }}
-                      placeholder={gs.lockout > 0 ? `🔒 Locked — ${fmt(gs.lockout)}` : "Type your answer…"}
+                     placeholder={gs.lockout > 0 || gs.wrongOnLevel >= MAX_WRONG_PER_LEVEL ? `🔒 Locked — ${gs.lockout > 0 ? fmt(gs.lockout) : "waiting for chain..."}` : "Type your answer…"}
                       value={answer}
                       onChange={e => setAnswer(e.target.value)}
                       onKeyDown={e => e.key==="Enter" && !gs.lockout && !loading && handleSubmit()}
-                      disabled={gs.lockout > 0 || !!loading}
+                     disabled={gs.lockout > 0 || gs.wrongOnLevel >= MAX_WRONG_PER_LEVEL || !!loading}
                     />
-                    <button onClick={handleSubmit} disabled={gs.lockout>0||!!loading}
+                    <button onClick={handleSubmit} disabled={gs.lockout>0 || gs.wrongOnLevel >= MAX_WRONG_PER_LEVEL || !!loading}
                       style={{ background:gs.lockout>0?"#333":diffStyle.border, border:"none", color:"#050508", fontWeight:700, padding:"14px 24px", borderRadius:10, fontSize:14, cursor:gs.lockout>0?"not-allowed":"pointer", fontFamily:"'Courier New',monospace", opacity:loading?0.6:1, minWidth:100 }}>
                       {loading ? "⏳" : "Submit ↵"}
                     </button>
