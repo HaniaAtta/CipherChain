@@ -1,4 +1,4 @@
-\import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { ethers } from "ethers";
 import { CONTRACT_ADDRESS, ABI } from "./contract";
 
