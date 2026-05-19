@@ -347,22 +347,24 @@ export default function App() {
         await refreshAll(wallet); // sync real lockoutUntil from chain
 
      } else if (raw.includes("wrong") || raw.includes("incorrect") || raw.includes("invalid") || raw.includes("not correct") || raw.includes("try again") || raw.includes("ctf:")) {
-        triggerFlash(flashSlot);
-        // Optimistic local increment
-       const newWrong = Math.min(gs.wrongOnLevel + 1, MAX_WRONG_PER_LEVEL);
-const willLock = newWrong >= MAX_WRONG_PER_LEVEL;
-setGs(g => ({ ...g, wrongOnLevel: newWrong, lockout: willLock ? LOCKOUT_MINUTES * 60 : g.lockout }));
-setFeedback({ type:"err", msg:`❌ Wrong answer. ${MAX_WRONG_PER_LEVEL - newWrong} attempt${MAX_WRONG_PER_LEVEL - newWrong !== 1 ? "s" : ""} left before lockout!` });
-await new Promise(r => setTimeout(r, FLASH_MS + 300));
-const prevWrong = newWrong;
-const prevLockout = willLock ? LOCKOUT_MINUTES * 60 : 0;
-await refreshAll(wallet);
-// preserve lockout and wrongOnLevel if chain hasn't confirmed yet
-setGs(g => ({
-  ...g,
-  wrongOnLevel: g.lockout > 0 ? MAX_WRONG_PER_LEVEL : (g.wrongOnLevel > 0 ? g.wrongOnLevel : prevWrong),
-  lockout: g.lockout > 0 ? g.lockout : prevLockout,
-}));
+  triggerFlash(flashSlot);
+  const newWrong = Math.min(gs.wrongOnLevel + 1, MAX_WRONG_PER_LEVEL);
+  const willLock = newWrong >= MAX_WRONG_PER_LEVEL;
+  const lockoutSecs = willLock ? LOCKOUT_MINUTES * 60 : 0;
+  setGs(g => ({
+    ...g,
+    wrongOnLevel: newWrong,
+    lockout: willLock ? lockoutSecs : g.lockout,
+  }));
+  setFeedback({ type:"err", msg: willLock
+    ? `🔒 Too many wrong answers! Locked out for ${LOCKOUT_MINUTES} minutes.`
+    : `❌ Wrong answer. ${MAX_WRONG_PER_LEVEL - newWrong} attempt${MAX_WRONG_PER_LEVEL - newWrong !== 1 ? "s" : ""} left before lockout!`
+  });
+  // only refresh if NOT locking out — refreshAll would reset the lockout to 0
+  if (!willLock) {
+    await new Promise(r => setTimeout(r, FLASH_MS + 300));
+    await refreshAll(wallet);
+  }
 
 
 
