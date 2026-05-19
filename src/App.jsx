@@ -123,11 +123,12 @@ function AttemptCircles({ wrongOnLevel, flashIdx, lockout }) {
           return (
             <div key={i} style={{
               width:34, height:34, borderRadius:9,
-              background: isPerm ? "#1c1c1c" : isFlash ? "#991b1b" : "#1a1a1a",
-              border:`2px solid ${isPerm ? "#3a3a3a" : isFlash ? "#ef4444" : "#2a2a2a"}`,
+ background: isPerm ? "#7f1d1d" : isFlash ? "#991b1b" : "#1a1a1a",
+border:`2px solid ${isPerm ? "#ef4444" : isFlash ? "#ef4444" : "#2a2a2a"}`,
+
               display:"flex", alignItems:"center", justifyContent:"center",
               fontSize:15,
-              color: isPerm ? "#555" : isFlash ? "#fff" : "#333",
+           color: isPerm ? "#fca5a5" : isFlash ? "#fff" : "#333",
               transition:"background .15s, border-color .15s",
               boxShadow: isFlash
                 ? "0 0 20px rgba(239,68,68,.9)"
@@ -345,7 +346,7 @@ export default function App() {
         await new Promise(r => setTimeout(r, 800));
         await refreshAll(wallet); // sync real lockoutUntil from chain
 
-      } else if (raw.includes("wrong") || raw.includes("incorrect") || raw.includes("invalid answer") || raw.includes("not correct") || raw.includes("answer")) {
+     } else if (raw.includes("wrong") || raw.includes("incorrect") || raw.includes("invalid") || raw.includes("not correct") || raw.includes("try again") || raw.includes("ctf:")) {
         triggerFlash(flashSlot);
         // Optimistic local increment
        const newWrong = Math.min(gs.wrongOnLevel + 1, MAX_WRONG_PER_LEVEL);
@@ -473,7 +474,7 @@ setGs(g => ({ ...g, wrongOnLevel: g.wrongOnLevel > 0 ? g.wrongOnLevel : prevWron
   };
 
   // ── Force reset: drain ETH first then resetRound, bypassing prize-pool guard ─
-  const handleForceReset = async () => {
+ const handleForceReset = async () => {
   if (!window.confirm("⚠️ FORCE RESET: This will wipe all player data. Prize pool must be 0 or use expireRound first. Continue?")) return;
   setOwnerFeedback(null); setOwnerLoading("Force Reset");
   try {
@@ -493,6 +494,7 @@ setGs(g => ({ ...g, wrongOnLevel: g.wrongOnLevel > 0 ? g.wrongOnLevel : prevWron
     setOwnerFeedback({ type:"err", msg:`❌ Reset failed: ${e.reason || e.message}. If players are in game, prize pool must be 0 first — call expireRound or wait for a winner.` });
   } finally { setOwnerLoading(""); }
 };
+
 
 
   // ── Derived display ────────────────────────────────────────────────────────
