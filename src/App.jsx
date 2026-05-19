@@ -104,14 +104,72 @@ function RoundDurationControl({ ownerLoading, onSet }) {
   );
 }
 
+// ── Attempt Circles — turns red as wrong answers accumulate, flashes on lockout ──
+function AttemptCircles({ wrongOnLevel, lockout }) {
+  return (
+    <div style={{marginBottom:16}}>
+      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+        {Array.from({length:MAX_WRONG_PER_LEVEL}).map((_,i) => {
+          const isUsed = i < wrongOnLevel;
+          const isLast = isUsed && i === wrongOnLevel - 1;
+          const allFull = wrongOnLevel >= MAX_WRONG_PER_LEVEL;
+          return (
+            <div
+              key={i}
+              style={{
+                width:34,
+                height:34,
+                borderRadius:9,
+                background: isUsed
+                  ? (allFull ? "#7f1d1d" : "#991b1b")
+                  : "#1a1a1a",
+                border: `2px solid ${isUsed ? (allFull ? "#b91c1c" : "#ef4444") : "#2a2a2a"}`,
+                display:"flex",
+                alignItems:"center",
+                justifyContent:"center",
+                fontSize:17,
+                transition:"background .35s, border-color .35s, box-shadow .35s",
+                boxShadow: isUsed
+                  ? `0 0 ${isLast ? "16px" : "8px"} rgba(239,68,68,${isLast ? ".7" : ".35"})`
+                  : "none",
+                animation: allFull && lockout > 0 ? "lockPulse 1s infinite" : isLast ? "wrongFlash .5s ease" : "none",
+              }}
+            >
+              {isUsed ? "✗" : "○"}
+            </div>
+          );
+        })}
+        <span style={{
+          marginLeft:10,
+          fontSize:13,
+          color: wrongOnLevel >= MAX_WRONG_PER_LEVEL
+            ? "#ef4444"
+            : wrongOnLevel >= MAX_WRONG_PER_LEVEL - 1
+            ? "#f97316"
+            : wrongOnLevel >= MAX_WRONG_PER_LEVEL - 2
+            ? "#facc15"
+            : "#94a3b8",
+          fontWeight: wrongOnLevel >= MAX_WRONG_PER_LEVEL - 1 ? 700 : 400,
+          animation: wrongOnLevel >= MAX_WRONG_PER_LEVEL - 1 ? "pulse 1s infinite" : "none",
+        }}>
+          {wrongOnLevel >= MAX_WRONG_PER_LEVEL
+            ? `🔒 Locked out for ${LOCKOUT_MINUTES}m!`
+            : wrongOnLevel === MAX_WRONG_PER_LEVEL - 1
+            ? `⚠️ LAST ATTEMPT — then ${LOCKOUT_MINUTES}m lockout!`
+            : `${MAX_WRONG_PER_LEVEL - wrongOnLevel} attempts left before ${LOCKOUT_MINUTES}m lockout`}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState("home");
   const [wallet, setWallet] = useState("");
 
-  // ── ALL game state in one object to avoid stale closure issues ──────────
   const [gs, setGs] = useState({
     entered: false,
-    currentLevel: 0,   // 0-based, matches contract
+    currentLevel: 0,
     score: 0,
     attempts: 0,
     wrongs: 0,
@@ -119,7 +177,7 @@ export default function App() {
     hintTokens: 2,
     lockout: 0,
     won: false,
-    hint: "",          // puzzle text for current level
+    hint: "",
     partialHint: "",
     gameStartedAt: null,
     elapsed: 0,
@@ -136,14 +194,14 @@ export default function App() {
   const [ownerFeedback, setOwnerFeedback] = useState(null);
   const [ownerLoading, setOwnerLoading] = useState("");
 
-  // Lockout countdown
+  // ── Lockout countdown ────────────────────────────────────────────────────
   useEffect(()=>{
     if(gs.lockout<=0) return;
     const t=setInterval(()=>setGs(g=>({...g,lockout:Math.max(0,g.lockout-1)})),1000);
     return()=>clearInterval(t);
   },[gs.lockout]);
 
-  // Elapsed timer
+  // ── Elapsed timer ────────────────────────────────────────────────────────
   useEffect(()=>{
     if(!gs.gameStartedAt||gs.won) return;
     const t=setInterval(()=>setGs(g=>({...g,elapsed:Math.floor((Date.now()-g.gameStartedAt)/1000)})),1000);
@@ -160,18 +218,12 @@ export default function App() {
     return new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
   },[]);
 
-  // ── THE KEY FIX: one function that reads EVERYTHING fresh from chain ────
-  // Uses getPlayerStats(addr) for reliable reads + getHintForLevel for puzzle
+  // ── Full chain refresh ───────────────────────────────────────────────────
   const refreshAll = useCallback(async (addr) => {
     if(!addr) return;
     try {
       const c = await getContract();
-
-      // 1. getMyStats — called with provider so msg.sender = addr via eth_call
-      //    BUT getMyStats requires mustHaveEntered. Use getPlayerStats instead
-      //    which is public and takes an address param — always works.
       const stats = await c.getPlayerStats(addr);
-      // getPlayerStats returns: currentLevel, totalAttempts, wrongAttempts, score, hasWon, hasEntered, accuracyPct
 
       const lvl        = Number(stats.currentLevel);
       const total      = Number(stats.totalAttempts);
@@ -180,7 +232,6 @@ export default function App() {
       const hasWon     = stats.hasWon;
       const hasEntered = stats.hasEntered;
 
-      // 2. Read wrongOnCurrentLevel from the public players mapping directly
       let wrongOnLevel = 0;
       let lockoutSecs  = 0;
       let hintTokens   = 2;
@@ -192,19 +243,17 @@ export default function App() {
         entryTime    = Number(raw.entryTime || 0);
         const lockoutUntil = Number(raw.lockoutUntil || 0);
         const now = Math.floor(Date.now()/1000);
-        lockoutSecs = lockoutUntil > now ? lockoutUntil - now : 0;
+        // +2s buffer for block timestamp vs wall clock drift
+        lockoutSecs = lockoutUntil > now ? (lockoutUntil - now) + 2 : 0;
       } catch(e){ console.warn("players() read failed:", e); }
 
-      // 3. Fetch hint for current level — only if not won
       let hint = "";
       if(!hasWon && lvl < LEVELS.length) {
         try {
-          // getHintForLevel(n) is 1-indexed and fully public — no mustHaveEntered
           hint = await c.getHintForLevel(lvl + 1);
         } catch(e){ console.warn("getHintForLevel failed:", e); }
       }
 
-      // 4. Game status for prize pool
       try {
         const status = await c.getGameStatus();
         setPrizePool(ethers.formatEther(status.prizePool));
@@ -226,7 +275,6 @@ export default function App() {
         lockout:      lockoutSecs,
         won:          hasWon,
         hint,
-        // Keep partialHint unless level changed (means new level, clear it)
         partialHint:  prev.currentLevel !== lvl ? "" : prev.partialHint,
         gameStartedAt: prev.gameStartedAt || (entryTime > 0 ? gameStartedAt : null),
       }));
@@ -257,7 +305,6 @@ export default function App() {
       const tx = await c.enterGame({value: ethers.parseEther("0.01")});
       await tx.wait();
       setFeedback({type:"ok",msg:"✅ Entered! Refreshing..."});
-      // Wait one block for state to settle then refresh
       await new Promise(r=>setTimeout(r,1500));
       await refreshAll(wallet);
       setGs(g=>({...g,gameStartedAt:Date.now(),elapsed:0}));
@@ -275,6 +322,7 @@ export default function App() {
     } finally { setLoading(""); }
   };
 
+  // ── Submit answer — with improved lockout detection ──────────────────────
   const handleSubmit = async () => {
     if(gs.lockout>0||!answer.trim()||loading) return;
     try {
@@ -285,49 +333,73 @@ export default function App() {
       await tx.wait();
       setAnswer("");
       setFeedback({type:"ok",msg:"✅ Correct! Loading next level..."});
-      // Wait for chain to settle then pull fresh state
       await new Promise(r=>setTimeout(r,1500));
       await refreshAll(wallet);
-      // Check if won after refresh
       setGs(g=>{
         if(g.won) setFeedback({type:"ok",msg:"🏆 You won! Prize sent to your wallet!"});
         else setFeedback({type:"ok",msg:`✅ Level ${g.currentLevel} — keep going!`});
         return g;
       });
     } catch(e){
-      const msg = e.reason || e.message || "";
-      if(msg.includes("wrong answer")||msg.includes("wrong")){
-        setFeedback({type:"err",msg:"❌ Wrong answer. Try again!"});
-      } else if(msg.includes("locked out")||msg.includes("locked")){
+      const raw = (e.reason || e.message || "").toLowerCase();
+
+      if(raw.includes("locked")||raw.includes("lockout")||raw.includes("lock out")||raw.includes("too many")) {
+        // Immediately refresh to get lockoutUntil from chain
+        await refreshAll(wallet);
         setFeedback({type:"err",msg:`🔒 Too many wrong answers! Locked out for ${LOCKOUT_MINUTES} minutes.`});
-      } else if(msg.includes("already won")){
+      } else if(raw.includes("wrong")||raw.includes("incorrect")||raw.includes("invalid answer")) {
+        // Optimistic local increment of wrongOnLevel so circles update instantly
+        setGs(g => {
+          const newWrong = Math.min(g.wrongOnLevel + 1, MAX_WRONG_PER_LEVEL);
+          const willLockout = newWrong >= MAX_WRONG_PER_LEVEL;
+          return {
+            ...g,
+            wrongOnLevel: newWrong,
+            // If we just hit 5, pre-set a local lockout timer while chain confirms
+            lockout: willLockout ? LOCKOUT_MINUTES * 60 : g.lockout,
+          };
+        });
+        setFeedback({type:"err",msg:"❌ Wrong answer. Try again!"});
+        await new Promise(r=>setTimeout(r,800));
+        // Then sync truth from chain
+        await refreshAll(wallet);
+      } else if(raw.includes("already won")) {
         setFeedback({type:"ok",msg:"🏆 You already won this round!"});
+      } else if(raw.includes("time")||raw.includes("expired")||raw.includes("deadline")) {
+        setFeedback({type:"err",msg:"⏰ Round deadline has passed!"});
       } else {
-        setFeedback({type:"err",msg:`❌ ${msg.slice(0,120)}`});
+        setFeedback({type:"err",msg:`❌ ${(e.reason||e.message||"").slice(0,120)}`});
+        await new Promise(r=>setTimeout(r,800));
+        await refreshAll(wallet);
       }
-      await new Promise(r=>setTimeout(r,800));
-      await refreshAll(wallet);
     } finally { setLoading(""); }
   };
 
+  // ── Use hint token — captures return value via staticCall ────────────────
   const handleHint = async () => {
     if(gs.hintTokens<=0||loading) return;
     try {
       setLoading("Getting hint...");
+
+      // Capture return value before sending tx
+      let partialHintText = "";
+      try {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        const cRead = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
+        partialHintText = await cRead.useHintToken.staticCall({ from: wallet });
+      } catch(e){ console.warn("staticCall hint failed:", e); }
+
       const c = await getContract(true);
       const tx = await c.useHintToken();
       await tx.wait();
       await refreshAll(wallet);
-      // After refresh, read the partialHint from contract
-      try {
-        const c2 = await getContract();
-        // getHintForLevel is public; partial hint needs useHintToken which we already called
-        // Read it from the level struct — use getHintForLevel which returns the main hint
-        // The partialHint was returned by useHintToken tx but we can't easily get return value
-        // So we store it from the tx receipt event or re-read from players mapping
-        // Simplest: show a message telling them the token was used and check their hint
-        setGs(g=>({...g, partialHint:"💡 Hint token used! Check the partial hint below the puzzle."}));
-      } catch(e){}
+
+      setGs(g=>({
+        ...g,
+        partialHint: partialHintText
+          ? `💡 Partial hint: ${partialHintText}`
+          : "💡 Hint token used! Re-read the puzzle carefully for hidden clues.",
+      }));
       setFeedback(null);
     } catch(e){
       setFeedback({type:"err",msg:`❌ ${e.reason||e.message}`});
@@ -383,14 +455,13 @@ export default function App() {
     } finally { setOwnerLoading(""); }
   };
 
-  // ── Derived display ─────────────────────────────────────────────────────
+  // ── Derived display ──────────────────────────────────────────────────────
   const isGameComplete  = gs.won || gs.currentLevel >= LEVELS.length;
   const safeLevel       = Math.min(gs.currentLevel, LEVELS.length - 1);
   const lvl             = LEVELS[safeLevel];
   const diffStyle       = DIFF_COLOR[lvl?.difficulty] || DIFF_COLOR.Easy;
   const progressPct     = Math.min((gs.currentLevel / LEVELS.length) * 100, 100);
   const safeWrong       = Math.max(0, Math.min(MAX_WRONG_PER_LEVEL, gs.wrongOnLevel));
-  const attemptsLeft    = MAX_WRONG_PER_LEVEL - safeWrong;
   const displayLevel    = Math.min(gs.currentLevel + 1, LEVELS.length);
   const accuracy        = gs.attempts > 0 ? Math.round(((gs.attempts - gs.wrongs) / gs.attempts) * 100) : 100;
 
@@ -401,6 +472,8 @@ export default function App() {
         @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
         @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
         @keyframes lockBlink{0%,100%{background:rgba(239,68,68,.15)}50%{background:rgba(239,68,68,.35)}}
+        @keyframes lockPulse{0%,100%{box-shadow:0 0 8px rgba(239,68,68,.4)}50%{box-shadow:0 0 22px rgba(239,68,68,.9)}}
+        @keyframes wrongFlash{0%{transform:scale(1)}30%{transform:scale(1.35);box-shadow:0 0 20px rgba(239,68,68,.9)}100%{transform:scale(1)}}
         *{box-sizing:border-box}
         input::placeholder{color:#333}
         input:focus{border-color:#00ffb4!important;outline:none;box-shadow:0 0 0 3px rgba(0,255,180,.1)}
@@ -417,7 +490,6 @@ export default function App() {
           <span style={{fontSize:26,color:"#00ffb4"}}>⬡</span>
           <span style={{fontSize:20,fontWeight:700,letterSpacing:2,color:"#00ffb4"}}>CipherChain</span>
         </div>
-        {/* NAV SCORE STRIP — always visible when entered */}
         {gs.entered && wallet && (
           <div style={{display:"flex",gap:16,alignItems:"center",fontSize:12}}>
             <span style={{color:"#facc15"}}>⭐ {gs.score.toLocaleString()}</span>
@@ -446,7 +518,7 @@ export default function App() {
 
       <main style={{position:"relative",zIndex:1,maxWidth:1000,margin:"0 auto",padding:"40px 24px 80px"}}>
 
-        {/* HOME */}
+        {/* ── HOME ── */}
         {page==="home" && (
           <div style={{textAlign:"center"}}>
             <div style={{display:"inline-block",background:"rgba(0,255,180,.1)",border:"1px solid #00ffb4",color:"#00ffb4",padding:"4px 16px",borderRadius:20,fontSize:11,letterSpacing:3,marginBottom:24}}>ROUND 1 · SEPOLIA TESTNET</div>
@@ -498,7 +570,7 @@ export default function App() {
           </div>
         )}
 
-        {/* GAME */}
+        {/* ── GAME ── */}
         {page==="game" && (
           <div style={{maxWidth:700,margin:"0 auto"}}>
             {!wallet?(
@@ -531,7 +603,7 @@ export default function App() {
               </div>
             ):(
               <>
-                {/* LOCKOUT */}
+                {/* LOCKOUT BANNER */}
                 {gs.lockout>0&&(
                   <div style={{animation:"lockBlink 1.5s infinite",border:"2px solid #ef4444",borderRadius:14,padding:"18px 24px",marginBottom:20,textAlign:"center"}}>
                     <div style={{fontSize:32,marginBottom:6}}>🔒</div>
@@ -576,7 +648,7 @@ export default function App() {
                     <div style={{color:"#e2e8f0",fontSize:18,fontWeight:700,marginTop:8}}>{lvl?.topic}</div>
                   </div>
 
-                  {/* PUZZLE TEXT — live from chain */}
+                  {/* PUZZLE TEXT */}
                   <div style={{background:"rgba(0,0,0,.4)",border:"1px solid #1a1a2a",borderRadius:10,padding:"16px 20px",marginBottom:16,minHeight:80}}>
                     {loading && !gs.hint ? (
                       <div style={{color:"#555",fontSize:13,textAlign:"center",padding:"8px 0",animation:"pulse 1s infinite"}}>⏳ Loading puzzle…</div>
@@ -587,41 +659,15 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* PARTIAL HINT */}
+                  {/* PARTIAL HINT — shown after hint token is used */}
                   {gs.partialHint&&(
-                    <div style={{background:"rgba(250,204,21,.07)",border:"1px solid #713f12",borderRadius:8,padding:"10px 16px",marginBottom:16,color:"#fde68a",fontSize:13}}>{gs.partialHint}</div>
+                    <div style={{background:"rgba(250,204,21,.07)",border:"1px solid #713f12",borderRadius:8,padding:"12px 16px",marginBottom:16,color:"#fde68a",fontSize:13,lineHeight:1.6}}>
+                      {gs.partialHint}
+                    </div>
                   )}
 
-                  {/* ATTEMPT TRACKER — always visible, always live */}
-                  <div style={{marginBottom:16}}>
-                    <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
-                      {Array.from({length:MAX_WRONG_PER_LEVEL}).map((_,i)=>{
-                        const isUsed = i < safeWrong;
-                        return (
-                          <div key={i} style={{
-                            width:32,height:32,borderRadius:8,
-                            background:isUsed?"#991b1b":"#1a1a1a",
-                            border:`1px solid ${isUsed?"#dc2626":"#2a2a2a"}`,
-                            display:"flex",alignItems:"center",justifyContent:"center",
-                            fontSize:16,transition:"all .3s",
-                            boxShadow:isUsed?"0 0 8px rgba(239,68,68,.4)":"none",
-                          }}>
-                            {isUsed?"✗":"○"}
-                          </div>
-                        );
-                      })}
-                      <span style={{
-                        marginLeft:10,fontSize:13,
-                        color:attemptsLeft<=1?"#ef4444":attemptsLeft<=2?"#f97316":"#94a3b8",
-                        fontWeight:attemptsLeft<=2?700:400,
-                        animation:attemptsLeft<=1?"pulse 1s infinite":"none",
-                      }}>
-                        {attemptsLeft===0?"⛔ Locking out…":
-                         attemptsLeft===1?`⚠️ LAST ATTEMPT — then ${LOCKOUT_MINUTES}m lockout!`:
-                         `${attemptsLeft} attempts left before ${LOCKOUT_MINUTES}m lockout`}
-                      </span>
-                    </div>
-                  </div>
+                  {/* ATTEMPT CIRCLES — red on wrong, pulse on full lockout */}
+                  <AttemptCircles wrongOnLevel={safeWrong} lockout={gs.lockout} />
 
                   {/* INPUT */}
                   <div style={{display:"flex",gap:10,marginBottom:12}}>
@@ -659,7 +705,7 @@ export default function App() {
           </div>
         )}
 
-        {/* LEADERBOARD */}
+        {/* ── LEADERBOARD ── */}
         {page==="leaderboard" && (
           <div>
             <div style={{color:"#555",fontSize:11,letterSpacing:4,marginBottom:16,borderBottom:"1px solid #111",paddingBottom:8}}>📊 LIVE LEADERBOARD</div>
@@ -690,7 +736,7 @@ export default function App() {
           </div>
         )}
 
-        {/* WINNERS */}
+        {/* ── WINNERS ── */}
         {page==="winners" && (
           <div>
             <div style={{color:"#555",fontSize:11,letterSpacing:4,marginBottom:16,borderBottom:"1px solid #111",paddingBottom:8}}>🏆 WINNER HISTORY</div>
@@ -713,7 +759,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ADMIN */}
+        {/* ── ADMIN ── */}
         {page==="admin" && isOwner && (
           <div style={{maxWidth:680,margin:"0 auto"}}>
             <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:28}}>
@@ -723,11 +769,14 @@ export default function App() {
                 <div style={{color:"#555",fontSize:12}}>Actions execute on-chain and affect all players</div>
               </div>
             </div>
+
             {ownerFeedback&&(
               <div style={{border:"1px solid",borderRadius:10,padding:"12px 16px",marginBottom:20,fontSize:14,background:ownerFeedback.type==="ok"?"rgba(0,255,180,.08)":"rgba(239,68,68,.08)",borderColor:ownerFeedback.type==="ok"?"#00ffb4":"#ef4444",color:ownerFeedback.type==="ok"?"#00ffb4":"#f87171"}}>
                 {ownerFeedback.msg}
               </div>
             )}
+
+            {/* STATS */}
             <div style={{display:"flex",gap:12,marginBottom:24,flexWrap:"wrap"}}>
               {[{label:"Prize Pool",val:`${prizePool} ETH`,color:"#facc15"},{label:"Players",val:playerCount,color:"#00ffb4"},{label:"Board",val:`${leaderboard.length}`,color:"#94a3b8"}].map(s=>(
                 <div key={s.label} style={{flex:1,minWidth:120,background:"rgba(255,255,255,.03)",border:"1px solid #1a2a1a",borderRadius:10,padding:"14px 18px",textAlign:"center"}}>
@@ -736,6 +785,8 @@ export default function App() {
                 </div>
               ))}
             </div>
+
+            {/* RESET ROUND */}
             <div style={{border:"2px solid #ef4444",borderRadius:14,padding:24,marginBottom:16,background:"rgba(239,68,68,.05)"}}>
               <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:16,flexWrap:"wrap"}}>
                 <div>
@@ -748,6 +799,41 @@ export default function App() {
                 </button>
               </div>
             </div>
+
+            {/* FORCE RESET / EMERGENCY */}
+            <div style={{border:"2px solid #f97316",borderRadius:14,padding:24,marginBottom:16,background:"rgba(249,115,22,.05)"}}>
+              <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:16,flexWrap:"wrap"}}>
+                <div>
+                  <div style={{color:"#fb923c",fontWeight:700,fontSize:16,marginBottom:6}}>⚠️ Force Reset (Emergency)</div>
+                  <div style={{color:"#888",fontSize:13,lineHeight:1.6}}>
+                    Bypasses prize pool check. Use only if funds are stuck.<br/>
+                    <code style={{color:"#fb923c",fontSize:12}}>emergencyWithdraw()</code> sends ETH to owner first, then resets.
+                  </div>
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:10,alignItems:"flex-end"}}>
+                  <button
+                    onClick={()=>{
+                      if(window.confirm("⚠️ EMERGENCY: Withdraw all ETH to owner wallet now?"))
+                        ownerAction("Emergency Withdraw", c=>c.emergencyWithdraw());
+                    }}
+                    disabled={!!ownerLoading}
+                    style={{background:"#f97316",border:"none",color:"#fff",fontWeight:700,padding:"10px 20px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"'Courier New',monospace",opacity:ownerLoading?"0.5":"1",whiteSpace:"nowrap"}}>
+                    {ownerLoading==="Emergency Withdraw"?"⏳…":"💸 Emergency Withdraw"}
+                  </button>
+                  <button
+                    onClick={()=>{
+                      if(window.confirm("⚠️ Force reset ALL player data + prize pool? Cannot be undone."))
+                        ownerAction("Force Reset", c=>c.forceReset());
+                    }}
+                    disabled={!!ownerLoading}
+                    style={{background:"rgba(249,115,22,.2)",border:"1px solid #f97316",color:"#fb923c",fontWeight:700,padding:"10px 20px",borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"'Courier New',monospace",opacity:ownerLoading?"0.5":"1",whiteSpace:"nowrap"}}>
+                    {ownerLoading==="Force Reset"?"⏳…":"🔥 Force Reset Round"}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* PAUSE / RESUME */}
             <div style={{border:"1px solid #a855f7",borderRadius:14,padding:24,marginBottom:16,background:"rgba(168,85,247,.05)"}}>
               <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:16,flexWrap:"wrap"}}>
                 <div>
@@ -766,6 +852,8 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {/* SET ROUND DURATION */}
             <RoundDurationControl ownerLoading={ownerLoading} onSet={(s)=>ownerAction("Set Round Duration",c=>c.setRoundDuration(s))}/>
           </div>
         )}
@@ -777,3 +865,4 @@ export default function App() {
     </div>
   );
 }
+
