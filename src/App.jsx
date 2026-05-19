@@ -354,10 +354,15 @@ const willLock = newWrong >= MAX_WRONG_PER_LEVEL;
 setGs(g => ({ ...g, wrongOnLevel: newWrong, lockout: willLock ? LOCKOUT_MINUTES * 60 : g.lockout }));
 setFeedback({ type:"err", msg:`❌ Wrong answer. ${MAX_WRONG_PER_LEVEL - newWrong} attempt${MAX_WRONG_PER_LEVEL - newWrong !== 1 ? "s" : ""} left before lockout!` });
 await new Promise(r => setTimeout(r, FLASH_MS + 300));
-// refresh but preserve wrongOnLevel if chain resets it
 const prevWrong = newWrong;
+const prevLockout = willLock ? LOCKOUT_MINUTES * 60 : 0;
 await refreshAll(wallet);
-setGs(g => ({ ...g, wrongOnLevel: g.wrongOnLevel > 0 ? g.wrongOnLevel : prevWrong }));
+// preserve lockout and wrongOnLevel if chain hasn't confirmed yet
+setGs(g => ({
+  ...g,
+  wrongOnLevel: g.lockout > 0 ? MAX_WRONG_PER_LEVEL : (g.wrongOnLevel > 0 ? g.wrongOnLevel : prevWrong),
+  lockout: g.lockout > 0 ? g.lockout : prevLockout,
+}));
 
 
 
